@@ -1,0 +1,1066 @@
+/* ====================================================
+   BINBUDDY - APP ENGINE (Workflow-Driven Backend Logic)
+   ==================================================== */
+
+const STORAGE_KEY = "binbuddy-state-v2";
+const SESSION_KEY = "binbuddy-session-v1";
+const ROLE_ALIASES = {
+  user: "household",
+  household: "household",
+  collector: "collector",
+  admin: "admin"
+};
+
+const ROLE_HOME_SCREEN = {
+  household: "home",
+  collector: "collector",
+  admin: "admin"
+};
+
+const ROLE_ALLOWED_SCREENS = {
+  household: new Set([
+    "home",
+    "track",
+    "guide",
+    "rewards",
+    "profile",
+    "leaderboard",
+    "notifications",
+    "education",
+    "about",
+    "xml-viewer"
+  ]),
+  collector: new Set(["collector", "collector-profile"]),
+  admin: new Set(["admin", "admin-profile"])
+};
+
+const BADGE_LEVELS = [
+  { min: 0, label: "Eco Starter" },
+  { min: 100, label: "Eco Supporter" },
+  { min: 300, label: "Eco Champion" },
+  { min: 700, label: "Eco Hero" }
+];
+
+const AppState = {
+  currentScreen: "auth",
+  role: "household",
+  authMode: "login",
+  logType: "bio",
+  logQty: 1.0,
+  currentUserId: null,
+  currentUserName: null,
+  users: [],
+  logs: [],
+  redemptions: [],
+  notifications: []
+};
+
+function normalizeRole(role) {
+  return ROLE_ALIASES[role] || "household";
+}
+
+const SessionManager = {
+  save(session) {
+    sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  },
+  load() {
+    const raw = sessionStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch (_err) {
+      sessionStorage.removeItem(SESSION_KEY);
+      return null;
+    }
+  },
+  clear() {
+    sessionStorage.removeItem(SESSION_KEY);
+  },
+  clearAppCache() {
+    localStorage.removeItem(STORAGE_KEY);
+  },
+  resetForFreshStart() {
+    // Force login every app launch/reload.
+    this.clear();
+  }
+};
+
+const RoleGuard = {
+  getAllowedScreens(role) {
+    const normalizedRole = normalizeRole(role);
+    return ROLE_ALLOWED_SCREENS[normalizedRole] || new Set([getRoleHomeScreen(normalizedRole)]);
+  },
+  getHomeScreen(role) {
+    return getRoleHomeScreen(normalizeRole(role));
+  },
+  canAccess(role, screen) {
+    return this.getAllowedScreens(role).has(screen);
+  }
+};
+
+const HistoryGuard = {
+  init() {
+    window.addEventListener("popstate", () => {
+      const user = AuthService.currentUser();
+      if (!user) {
+        goToAuthScreen(false);
+        this.resetToAuth();
+        return;
+      }
+      const screen = (window.history.state && window.history.state.screen) || RoleGuard.getHomeScreen(user.role);
+      goTo(screen, { trackHistory: false });
+    });
+  },
+  push(screen) {
+    window.history.pushState({ screen }, "", window.location.href);
+  },
+  resetToAuth() {
+    window.history.replaceState({ screen: "auth" }, "", window.location.href);
+  }
+};
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function formatDateTime(iso) {
+  return new Date(iso).toLocaleString();
+}
+
+function buildSeedState() {
+  return {
+    users: [
+      {
+        id: "USR001",
+        name: "Maria Santos",
+        email: "maria@email.com",
+        password: "password123",
+        role: "household",
+        ecoPoints: 1245,
+        streak: 7,
+        badge: "Eco Champion",
+        barangay: "Holy Spirit"
+      },
+      {
+        id: "COL001",
+        name: "Roberto Cruz",
+        email: "collector@email.com",
+        password: "password123",
+        role: "collector",
+        ecoPoints: 0,
+        streak: 0,
+        badge: "Collector",
+        barangay: "Holy Spirit"
+      },
+      {
+        id: "ADM001",
+        name: "Brgy. Holy Spirit Admin",
+        email: "admin@email.com",
+        password: "password123",
+        role: "admin",
+        ecoPoints: 0,
+        streak: 0,
+        badge: "Admin",
+        barangay: "Holy Spirit"
+      }
+    ],
+    logs: [
+      {
+        id: "LOG001",
+        userId: "USR001",
+        userName: "Maria Santos",
+        type: "PET",
+        weight: 1.2,
+        createdAt: nowIso(),
+        status: "Completed",
+        verifiedBy: "COL001",
+        completedAt: nowIso(),
+        ecoPointsAwarded: 24
+      },
+      {
+        id: "LOG002",
+        userId: "USR001",
+        userName: "Maria Santos",
+        type: "HDPE",
+        weight: 0.8,
+        createdAt: nowIso(),
+        status: "Pending",
+        verifiedBy: null,
+        completedAt: null,
+        ecoPointsAwarded: 0
+      }
+    ],
+    redemptions: [],
+    notifications: []
+  };
+}
+
+function persistState() {
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify({
+      users: AppState.users,
+      logs: AppState.logs,
+      redemptions: AppState.redemptions,
+      notifications: AppState.notifications
+    })
+  );
+}
+
+function loadState() {
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw) {
+    const seed = buildSeedState();
+    AppState.users = seed.users;
+    AppState.logs = seed.logs;
+    AppState.redemptions = seed.redemptions;
+    AppState.notifications = seed.notifications;
+    persistState();
+    return;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    AppState.users = parsed.users || [];
+    AppState.logs = parsed.logs || [];
+    AppState.redemptions = parsed.redemptions || [];
+    AppState.notifications = parsed.notifications || [];
+  } catch (_err) {
+    const fallback = buildSeedState();
+    AppState.users = fallback.users;
+    AppState.logs = fallback.logs;
+    AppState.redemptions = fallback.redemptions;
+    AppState.notifications = fallback.notifications;
+    persistState();
+  }
+}
+
+function persistSession() {
+  SessionManager.save({
+    currentUserId: AppState.currentUserId,
+    role: normalizeRole(AppState.role),
+    name: AppState.currentUserName
+  });
+}
+
+function clearSession() {
+  AppState.currentUserId = null;
+  AppState.currentUserName = null;
+  AppState.role = "household";
+  SessionManager.clear();
+}
+
+function loadSession() {
+  const parsed = SessionManager.load();
+  if (!parsed || !parsed.currentUserId) return;
+  const user = AppState.users.find(u => u.id === parsed.currentUserId);
+  if (!user) {
+    SessionManager.clear();
+    return;
+  }
+  const sessionRole = normalizeRole(parsed.role);
+  const userRole = normalizeRole(user.role);
+  if (sessionRole !== userRole) {
+    SessionManager.clear();
+    return;
+  }
+  AppState.currentUserId = user.id;
+  AppState.currentUserName = user.name || "User";
+  AppState.role = userRole;
+}
+
+function getRoleHomeScreen(role) {
+  return ROLE_HOME_SCREEN[normalizeRole(role)] || "home";
+}
+
+function getStartupScreen() {
+  // Enforce login gate on every startup.
+  return "auth";
+}
+
+const AuthService = {
+  register(payload) {
+    const { email, password, role } = payload;
+    const existing = AppState.users.find(u => u.email.toLowerCase() === email.toLowerCase() && u.role === role);
+    if (existing) return { ok: false, message: "Account already exists for this role." };
+    const idPrefix = role === "collector" ? "COL" : role === "admin" ? "ADM" : "USR";
+    const id = `${idPrefix}${String(AppState.users.length + 1).padStart(3, "0")}`;
+    const user = {
+      id,
+      name: (payload.name || email.split("@")[0].replace(/\./g, " ")).trim() || "User",
+      email,
+      password,
+      role,
+      ecoPoints: 0,
+      streak: 0,
+      badge: "Eco Starter",
+      barangay: "Holy Spirit"
+    };
+    AppState.users.push(user);
+    persistState();
+    return { ok: true, user };
+  },
+  login(payload) {
+    const { email, password } = payload;
+    const role = normalizeRole(payload.role);
+    const user = AppState.users.find(
+      u =>
+        u.email.toLowerCase() === email.toLowerCase() &&
+        u.password === password &&
+        normalizeRole(u.role) === role
+    );
+    if (!user) return { ok: false, message: "Invalid credentials for selected role." };
+    AppState.currentUserId = user.id;
+    AppState.currentUserName = user.name || "User";
+    AppState.role = normalizeRole(user.role);
+    persistSession();
+    return { ok: true, user };
+  },
+  currentUser() {
+    return AppState.users.find(u => u.id === AppState.currentUserId) || null;
+  }
+};
+
+const WasteLogService = {
+  normalizeWasteType(rawType) {
+    if (rawType === "PET" || rawType === "pet") return "PET";
+    if (rawType === "HDPE" || rawType === "hdpe") return "HDPE";
+    if (rawType === "bio") return "PET";
+    if (rawType === "rec") return "HDPE";
+    return null;
+  },
+  validate(weight, rawType, user) {
+    if (!user) return "Login required.";
+    const normalizedType = this.normalizeWasteType(rawType);
+    if (!normalizedType) return "Waste type selection is required (PET or HDPE only).";
+    if (weight === null || weight === undefined || Number.isNaN(weight)) return "Weight is required and must be numeric.";
+    if (weight <= 0) return "Weight must be greater than zero.";
+    return null;
+  },
+  createLog({ user, rawType, weight }) {
+    const log = {
+      id: `LOG${String(Date.now()).slice(-6)}`,
+      userId: user.id,
+      userName: user.name,
+      type: this.normalizeWasteType(rawType),
+      weight: Number(weight.toFixed(2)),
+      createdAt: nowIso(),
+      status: "Pending",
+      verifiedBy: null,
+      completedAt: null,
+      ecoPointsAwarded: 0
+    };
+    AppState.logs.unshift(log);
+    AppState.notifications.unshift({
+      text: `Log submitted (${log.type}, ${log.weight} kg). Status: Pending.`,
+      createdAt: nowIso()
+    });
+    persistState();
+    return log;
+  }
+};
+
+const VerificationService = {
+  verifyLog(logId, isVerified, collectorId) {
+    const log = AppState.logs.find(l => l.id === logId);
+    if (!log) return null;
+    if (!isVerified) {
+      log.status = "Pending";
+      persistState();
+      return log;
+    }
+    if (log.status === "Completed") return log;
+    log.status = "Completed";
+    log.verifiedBy = collectorId;
+    log.completedAt = nowIso();
+    log.ecoPointsAwarded = Math.round(log.weight * (log.type === "PET" ? 20 : 25));
+    const user = AppState.users.find(u => u.id === log.userId);
+    if (user) {
+      user.ecoPoints += log.ecoPointsAwarded;
+      user.streak += 1;
+      user.badge = BADGE_LEVELS.reduce((acc, level) => (user.ecoPoints >= level.min ? level.label : acc), "Eco Starter");
+      AppState.notifications.unshift({
+        text: `Log ${log.id} completed. +${log.ecoPointsAwarded} EcoPoints awarded.`,
+        createdAt: nowIso()
+      });
+    }
+    persistState();
+    return log;
+  }
+};
+
+const RewardsService = {
+  catalog() {
+    return [
+      { id: "RWD-LOAD-50", name: "Mobile Load", display: "₱50 Load", cost: 500 },
+      { id: "RWD-VOUCH-100", name: "Voucher", display: "₱100 Voucher", cost: 1000 },
+      { id: "RWD-GCASH-75", name: "GCash", display: "₱75 GCash", cost: 750 }
+    ];
+  },
+  redeem(rewardId, user) {
+    const reward = this.catalog().find(r => r.id === rewardId);
+    if (!reward) return { ok: false, message: "Reward not found." };
+    if (!user) return { ok: false, message: "Login required." };
+    if (user.ecoPoints < reward.cost) return { ok: false, message: "Not enough EcoPoints." };
+    user.ecoPoints -= reward.cost;
+    AppState.redemptions.unshift({
+      id: `RDM${Date.now()}`,
+      userId: user.id,
+      rewardId: reward.id,
+      rewardName: reward.display,
+      cost: reward.cost,
+      createdAt: nowIso()
+    });
+    AppState.notifications.unshift({
+      text: `Redeemed ${reward.display} for ${reward.cost} points.`,
+      createdAt: nowIso()
+    });
+    persistState();
+    return { ok: true, reward };
+  }
+};
+
+const AnalyticsService = {
+  metrics() {
+    const total = AppState.logs.length;
+    const completed = AppState.logs.filter(l => l.status === "Completed").length;
+    const pending = total - completed;
+    const totalCollectedKg = AppState.logs
+      .filter(l => l.status === "Completed")
+      .reduce((sum, l) => sum + l.weight, 0);
+    const compliance = total > 0 ? Math.round((completed / total) * 100) : 0;
+    const ecoPointsDistributed = AppState.logs.reduce((sum, l) => sum + (l.ecoPointsAwarded || 0), 0);
+    return {
+      totalLogs: total,
+      completedLogs: completed,
+      pendingLogs: pending,
+      totalCollectedKg: Number(totalCollectedKg.toFixed(1)),
+      compliance,
+      ecoPointsDistributed
+    };
+  },
+  weeklySeries() {
+    const byDay = {};
+    AppState.logs.forEach(log => {
+      if (log.status !== "Completed") return;
+      const day = new Date(log.createdAt).toLocaleDateString(undefined, { weekday: "short" });
+      byDay[day] = (byDay[day] || 0) + log.weight;
+    });
+    const sequence = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    return sequence.map(day => ({ day, val: Number((byDay[day] || 0).toFixed(1)) }));
+  }
+};
+
+function initSplash() {
+  const splashScreen = document.getElementById("screen-splash");
+  const startupScreen = getStartupScreen();
+  if (!splashScreen) {
+    goTo(startupScreen);
+    return;
+  }
+  setTimeout(() => goTo(startupScreen), 1800);
+}
+
+function goTo(screen, options = {}) {
+  const { trackHistory = true } = options;
+  const user = AuthService.currentUser();
+  if (screen !== "auth" && screen !== "splash" && !user) {
+    showToast("Please login first.");
+    goToAuthScreen(false);
+    HistoryGuard.resetToAuth();
+    return;
+  }
+  if (user) {
+    const userRole = normalizeRole(user.role);
+    if (!RoleGuard.canAccess(userRole, screen)) {
+      const safeScreen = RoleGuard.getHomeScreen(userRole);
+      if (screen !== safeScreen) {
+        showToast(`${userRole === "household" ? "User" : userRole} dashboard only.`);
+      }
+      screen = safeScreen;
+    }
+  } else if (screen !== "auth" && screen !== "splash") {
+    screen = "auth";
+  }
+  if (screen === "auth") {
+    logout(false);
+    return;
+  }
+
+  document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
+  const target = document.getElementById(`screen-${screen}`);
+  if (target) target.classList.add("active");
+  AppState.currentScreen = screen;
+  if (trackHistory) HistoryGuard.push(screen);
+  syncBottomNav(user, screen);
+  const nav = document.getElementById("bottom-nav");
+  if (nav) {
+    const shouldHideNav = screen === "auth" || screen === "splash" || !user;
+    nav.classList.toggle("hidden", shouldHideNav);
+  }
+  refreshUI();
+}
+
+function syncBottomNav(user, screen) {
+  const role = user ? normalizeRole(user.role) : null;
+  document.querySelectorAll(".nav-item").forEach(btn => {
+    const itemRole = btn.dataset.role || "household";
+    const isRoleMatch = Boolean(role) && itemRole === role;
+    btn.classList.toggle("hidden", !isRoleMatch);
+    const action = btn.dataset.action || "";
+    const targetScreen = btn.dataset.nav || "";
+    const isActive = isRoleMatch && !action && targetScreen === screen;
+    btn.classList.toggle("active", isActive);
+  });
+}
+
+function showToast(message) {
+  const toast = document.getElementById("toast");
+  if (!toast) return;
+  toast.textContent = message;
+  toast.classList.add("show");
+  setTimeout(() => toast.classList.remove("show"), 2500);
+}
+
+function openLogModal() {
+  const user = AuthService.currentUser();
+  if (!user || user.role !== "household") {
+    showToast("Household login required.");
+    return;
+  }
+  document.getElementById("log-modal").classList.add("active");
+}
+
+function closeModal(id) {
+  const el = document.getElementById(id);
+  if (el) el.classList.remove("active");
+}
+
+function updateQtyUI() {
+  const qty = document.getElementById("qty-display");
+  if (qty) qty.textContent = AppState.logQty.toFixed(1);
+  const modalQty = document.getElementById("modal-qty");
+  if (modalQty) modalQty.textContent = AppState.logQty.toFixed(1);
+}
+
+function setupWasteTypeSelectors() {
+  const restrictChips = scopeSelector => {
+    const chips = document.querySelectorAll(`${scopeSelector} .waste-chip`);
+    chips.forEach(chip => {
+      const type = chip.dataset.type;
+      if (type === "bio") chip.textContent = "PET";
+      if (type === "rec") chip.textContent = "HDPE";
+      if (type === "res" || type === "spc") chip.style.display = "none";
+    });
+  };
+
+  restrictChips("#manual-panel");
+  restrictChips("#log-modal");
+
+  const manualChips = document.querySelectorAll("#manual-panel .waste-chip");
+  manualChips.forEach(chip => chip.classList.remove("active"));
+  const defaultManual = document.querySelector("#manual-panel .waste-chip[data-type='bio']");
+  if (defaultManual) defaultManual.classList.add("active");
+
+  const modalChips = document.querySelectorAll("#log-modal .waste-chip");
+  modalChips.forEach(chip => chip.classList.remove("active"));
+  const defaultModal = document.querySelector("#log-modal .waste-chip[data-type='bio']");
+  if (defaultModal) defaultModal.classList.add("active");
+
+  AppState.logType = "bio";
+}
+
+function increaseQty() {
+  AppState.logQty = Math.round((AppState.logQty + 0.1) * 10) / 10;
+  updateQtyUI();
+}
+
+function decreaseQty() {
+  AppState.logQty = Math.max(0.1, Math.round((AppState.logQty - 0.1) * 10) / 10);
+  updateQtyUI();
+}
+
+function getManualInputWeight() {
+  const qtyDisplay = document.getElementById("qty-display");
+  const parsedQty = qtyDisplay ? Number.parseFloat(qtyDisplay.textContent) : AppState.logQty;
+  return Number.isFinite(parsedQty) ? parsedQty : NaN;
+}
+
+function submitLog() {
+  const user = AuthService.currentUser();
+  if (!user || user.role !== "household") {
+    showToast("Only household users can submit logs.");
+    return;
+  }
+  const weight = Number.isFinite(AppState.logQty) ? AppState.logQty : getManualInputWeight();
+  const error = WasteLogService.validate(weight, AppState.logType, user);
+  if (error) {
+    showToast(error);
+    return;
+  }
+  const log = WasteLogService.createLog({ user, rawType: AppState.logType, weight });
+  closeModal("log-modal");
+  openSuccessModal(log);
+  refreshUI();
+}
+
+function openSuccessModal(log) {
+  const type = document.getElementById("success-type");
+  const qty = document.getElementById("success-qty");
+  const pts = document.getElementById("success-pts");
+  if (type) type.textContent = log.type;
+  if (qty) qty.textContent = `${log.weight} kg logged`;
+  if (pts) pts.textContent = "Status: Pending";
+  const modal = document.getElementById("success-modal");
+  if (modal) modal.classList.add("active");
+}
+
+function renderRecentLogs() {
+  const recent = document.getElementById("recent-logs");
+  if (recent) {
+    recent.innerHTML = AppState.logs.slice(0, 5).map(l => `
+      <div class="card" style="margin-bottom:8px">
+        <strong>${l.type}</strong><br/>
+        ${l.weight} kg • <strong>${l.status}</strong><br/>
+        <small>${formatDateTime(l.createdAt)}</small>
+      </div>
+    `).join("");
+  }
+  const history = document.getElementById("full-history");
+  if (history) {
+    history.innerHTML = AppState.logs.map(l => `
+      <div class="card" style="margin-bottom:8px">
+        <strong>${l.type}</strong><br/>
+        ${l.weight} kg • <strong>${l.status}</strong>
+        ${l.status === "Completed" ? `• +${l.ecoPointsAwarded} pts` : ""}<br/>
+        <small>${formatDateTime(l.createdAt)}</small>
+      </div>
+    `).join("");
+  }
+}
+
+function renderNotifications() {
+  const el = document.getElementById("notif-list");
+  if (!el) return;
+  el.innerHTML = AppState.notifications.slice(0, 20).map(n => `
+    <div class="card">
+      ${n.text}<br/>
+      <small>${formatDateTime(n.createdAt)}</small>
+    </div>
+  `).join("");
+}
+
+function renderLeaderboard() {
+  const users = AppState.users
+    .filter(u => u.role === "household")
+    .slice()
+    .sort((a, b) => b.ecoPoints - a.ecoPoints)
+    .slice(0, 10);
+  const el = document.getElementById("leaderboard-list");
+  if (!el) return;
+  el.innerHTML = users.map((u, i) => `
+    <div class="card" style="display:flex;justify-content:space-between">
+      <span>#${i + 1} ${u.name}</span>
+      <strong>${u.ecoPoints} pts</strong>
+    </div>
+  `).join("");
+}
+
+function renderProfile() {
+  const user = AuthService.currentUser();
+  const name = document.getElementById("profile-name");
+  const pts = document.getElementById("profile-pts");
+  const streak = document.getElementById("profile-streak");
+  const badge = document.getElementById("eco-badge-pts");
+  if (name) name.textContent = user ? (user.name || "User") : "User";
+  if (pts) pts.textContent = user ? user.ecoPoints : "0";
+  if (streak) streak.textContent = user ? user.streak : "0";
+  if (badge) badge.textContent = `⭐ ${user ? user.ecoPoints : 0} pts`;
+  document.querySelectorAll(".ecopoints-value").forEach(el => {
+    el.textContent = user ? user.ecoPoints : 0;
+  });
+}
+
+function renderHomeGreeting() {
+  const greeting = document.getElementById("home-greeting-name");
+  if (!greeting) return;
+  const user = AuthService.currentUser();
+  const name = user ? (user.name || "User") : (AppState.currentUserName || "User");
+  greeting.textContent = `Hi, ${name} 👋`;
+}
+
+function renderCollectorView() {
+  const list = document.getElementById("pickup-list");
+  if (!list) return;
+  const pendingFirst = AppState.logs.slice().sort((a, b) => (a.status === "Pending" ? -1 : 1));
+  list.innerHTML = pendingFirst.map(log => `
+    <div class="card" style="margin-bottom:10px">
+      <strong>${log.userName}</strong> • ${log.type} • ${log.weight} kg<br/>
+      <small>Status: <strong>${log.status}</strong></small>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="btn btn-outline" onclick="handleCollectorDecision('${log.id}',false)">Not Verified</button>
+        <button class="btn btn-primary" onclick="handleCollectorDecision('${log.id}',true)">Verify</button>
+      </div>
+    </div>
+  `).join("");
+  const metrics = AnalyticsService.metrics();
+  const statValues = document.querySelectorAll("#screen-collector .stat-value");
+  if (statValues[0]) statValues[0].textContent = metrics.totalLogs;
+  if (statValues[1]) statValues[1].textContent = metrics.completedLogs;
+  if (statValues[2]) statValues[2].textContent = metrics.totalLogs - metrics.completedLogs;
+  if (statValues[3]) statValues[3].textContent = metrics.pendingLogs;
+}
+
+function handleCollectorDecision(logId, isVerified) {
+  const user = AuthService.currentUser();
+  if (!user || user.role !== "collector") {
+    showToast("Collector login required.");
+    return;
+  }
+  const updated = VerificationService.verifyLog(logId, isVerified, user.id);
+  if (!updated) {
+    showToast("Log not found.");
+    return;
+  }
+  showToast(isVerified ? "Log marked as Completed." : "Status kept as Pending.");
+  refreshUI();
+}
+
+function renderAdminAnalytics() {
+  const metrics = AnalyticsService.metrics();
+  const kpis = document.querySelectorAll("#screen-admin .kpi-card .kpi-value");
+  if (kpis[0]) kpis[0].textContent = `${metrics.totalCollectedKg}kg`;
+  if (kpis[1]) kpis[1].textContent = `${metrics.compliance}%`;
+  if (kpis[2]) kpis[2].textContent = `${metrics.completedLogs}`;
+  if (kpis[3]) kpis[3].textContent = `${AppState.users.filter(u => u.role === "household").length}`;
+
+  const pointsNode = document.querySelector("#screen-admin .card .section-title + div");
+  if (pointsNode) pointsNode.textContent = `${metrics.ecoPointsDistributed}`;
+
+  const adminUsers = document.getElementById("admin-users");
+  if (adminUsers) {
+    const ranked = AppState.users
+      .filter(u => u.role === "household")
+      .slice()
+      .sort((a, b) => b.ecoPoints - a.ecoPoints)
+      .slice(0, 5);
+    adminUsers.innerHTML = ranked.map((u, i) => `
+      <div class="card" style="display:flex;justify-content:space-between">
+        <span>#${i + 1} ${u.name}</span>
+        <strong>${u.ecoPoints} pts</strong>
+      </div>
+    `).join("");
+  }
+
+  const chart = document.getElementById("admin-chart");
+  if (chart) {
+    const data = AnalyticsService.weeklySeries();
+    const max = Math.max(...data.map(d => d.val), 1);
+    chart.innerHTML = data.map(d => `
+      <div class="chart-col">
+        <div class="chart-val">${d.val}</div>
+        <div class="chart-bar" style="height:${(d.val / max) * 80}px"></div>
+        <div class="chart-label">${d.day}</div>
+      </div>
+    `).join("");
+  }
+}
+
+function initGuide() {
+  const el = document.getElementById("guide-items");
+  if (!el) return;
+  const items = [
+    { name: "PET Bottle", type: "PET" },
+    { name: "HDPE Detergent Bottle", type: "HDPE" },
+    { name: "Milk Jug", type: "HDPE" },
+    { name: "Water Bottle", type: "PET" }
+  ];
+  el.innerHTML = items.map(i => `
+    <div class="card">
+      <strong>${i.name}</strong><br/>
+      → ${i.type}
+    </div>
+  `).join("");
+}
+
+function initRewards() {
+  const grid = document.getElementById("rewards-grid");
+  if (!grid) return;
+  grid.innerHTML = RewardsService.catalog().map(r => `
+    <div class="card" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+      <div><strong>${r.display}</strong><br/><small>${r.cost} pts</small></div>
+      <button class="btn btn-outline" onclick="redeemReward('${r.id}')">Redeem</button>
+    </div>
+  `).join("");
+}
+
+function redeemReward(rewardId) {
+  const user = AuthService.currentUser();
+  if (!user || user.role !== "household") {
+    showToast("Only household users can redeem rewards.");
+    return;
+  }
+  const result = RewardsService.redeem(rewardId, user);
+  if (!result.ok) {
+    showToast(result.message);
+    return;
+  }
+  showToast(`Redeemed: ${result.reward.display}`);
+  refreshUI();
+}
+
+function initAuth() {
+  const loginBtn = document.getElementById("btn-login");
+  const guestBtn = document.getElementById("btn-guest");
+  const authTabs = document.querySelectorAll(".auth-tab");
+  const roleCards = document.querySelectorAll(".role-card");
+  const authPrimaryButton = document.getElementById("btn-login");
+  const authSubtitle = document.querySelector("#screen-auth .auth-header p");
+  const inputs = document.querySelectorAll("#screen-auth .form-control");
+  const emailInput = inputs[0];
+  const passwordInput = inputs[1];
+  const clearAuthFields = () => {
+    if (emailInput) emailInput.value = "";
+    if (passwordInput) passwordInput.value = "";
+  };
+  const focusAuthEmail = () => {
+    if (emailInput) emailInput.focus();
+  };
+  window.clearAuthFields = clearAuthFields;
+  window.focusAuthEmail = focusAuthEmail;
+  clearAuthFields();
+
+  authTabs.forEach((tab, idx) => {
+    tab.addEventListener("click", () => {
+      authTabs.forEach(t => t.classList.remove("active"));
+      tab.classList.add("active");
+      AppState.authMode = idx === 1 ? "register" : "login";
+      if (authPrimaryButton) {
+        authPrimaryButton.textContent = AppState.authMode === "register" ? "Create BinBuddy Account" : "Login to BinBuddy";
+      }
+      if (authSubtitle) {
+        authSubtitle.textContent = AppState.authMode === "register"
+          ? "Create your account and start earning EcoPoints"
+          : "Smart waste tracking for a cleaner Lipa City";
+      }
+    });
+  });
+
+  roleCards.forEach(card => {
+    card.addEventListener("click", () => {
+      roleCards.forEach(c => c.classList.remove("selected"));
+      card.classList.add("selected");
+      AppState.role = normalizeRole(card.dataset.role);
+    });
+  });
+
+  if (loginBtn) {
+    loginBtn.addEventListener("click", () => {
+      const email = (emailInput ? emailInput.value : "").trim();
+      const password = passwordInput ? passwordInput.value : "";
+      if (!email || !password) {
+        showToast("Email and password are required.");
+        return;
+      }
+      if (AppState.authMode === "register") {
+        const reg = AuthService.register({ email, password, role: AppState.role });
+        if (!reg.ok) {
+          showToast(reg.message);
+          return;
+        }
+      }
+      const login = AuthService.login({ email, password, role: AppState.role });
+      if (!login.ok) {
+        showToast(login.message);
+        return;
+      }
+      const targetScreen = getRoleHomeScreen(login.user.role);
+      goTo(targetScreen);
+      showToast(`Welcome, ${login.user.name}`);
+      refreshUI();
+    });
+  }
+
+  if (guestBtn) {
+    guestBtn.addEventListener("click", () => {
+      const guest = AppState.users.find(u => u.role === "household");
+      if (guest) {
+        AppState.currentUserId = guest.id;
+        AppState.currentUserName = guest.name || "User";
+        AppState.role = normalizeRole(guest.role);
+        persistSession();
+      }
+      goTo("home");
+      showToast("Guest household mode");
+      refreshUI();
+    });
+  }
+}
+
+function initAdminActions() {
+  const exportBtn = document.getElementById("btn-export");
+  if (!exportBtn) return;
+  exportBtn.addEventListener("click", () => {
+    const user = AuthService.currentUser();
+    if (!user || user.role !== "admin") {
+      showToast("Admin access only.");
+      return;
+    }
+    showToast("CSV export generated.");
+  });
+}
+
+function initNavigation() {
+  document.querySelectorAll(".nav-item").forEach(btn => {
+    const navigate = () => {
+      const action = btn.dataset.action;
+      if (action === "logout") {
+        logout();
+        return;
+      }
+      const screen = btn.dataset.nav;
+      if (screen) goTo(screen);
+    };
+    btn.addEventListener("click", navigate);
+    btn.addEventListener(
+      "touchend",
+      e => {
+        e.preventDefault();
+        navigate();
+      },
+      { passive: false }
+    );
+  });
+
+  const plus = document.getElementById("qty-plus");
+  const minus = document.getElementById("qty-minus");
+  if (plus) plus.addEventListener("click", increaseQty);
+  if (minus) minus.addEventListener("click", decreaseQty);
+
+  document.querySelectorAll("#manual-panel .waste-chip").forEach(chip => {
+    chip.addEventListener("click", () => {
+      if (chip.style.display === "none") return;
+      document.querySelectorAll("#manual-panel .waste-chip").forEach(c => c.classList.remove("active"));
+      chip.classList.add("active");
+      AppState.logType = chip.dataset.type;
+    });
+  });
+
+  const submitBtn = document.getElementById("btn-submit-log");
+  if (submitBtn) {
+    submitBtn.addEventListener("click", () => {
+      const user = AuthService.currentUser();
+      if (!user || user.role !== "household") {
+        showToast("Only household users can submit logs.");
+        return;
+      }
+      const weight = getManualInputWeight();
+      const error = WasteLogService.validate(weight, AppState.logType, user);
+      if (error) {
+        showToast(error);
+        return;
+      }
+      AppState.logQty = weight;
+      submitLog();
+    });
+  }
+}
+
+function selectModalType(type, el) {
+  const normalized = type === "bio" || type === "pet" || type === "PET"
+    ? "bio"
+    : type === "rec" || type === "hdpe" || type === "HDPE"
+      ? "rec"
+      : null;
+  if (!normalized || !el || el.style.display === "none") {
+    showToast("Please select PET or HDPE only.");
+    return;
+  }
+  document.querySelectorAll("#log-modal .waste-chip").forEach(c => c.classList.remove("active"));
+  el.classList.add("active");
+  AppState.logType = normalized;
+}
+
+function refreshUI() {
+  renderHomeGreeting();
+  renderProfile();
+  renderRecentLogs();
+  renderNotifications();
+  renderCollectorView();
+  renderLeaderboard();
+  renderAdminAnalytics();
+  initRewards();
+  persistState();
+}
+
+function clearRuntimeUserContext() {
+  AppState.currentUserId = null;
+  AppState.currentUserName = null;
+  AppState.role = "household";
+  AppState.currentScreen = "auth";
+  AppState.logType = "bio";
+  AppState.logQty = 1.0;
+}
+
+function logout(showMessage = true, requireConfirmation = false) {
+  if (requireConfirmation && !window.confirm("Are you sure you want to logout?")) {
+    return;
+  }
+  SessionManager.clearAppCache();
+  clearRuntimeUserContext();
+  clearSession();
+  loadState();
+  goToAuthScreen(false);
+  if (window.clearAuthFields) window.clearAuthFields();
+  if (window.focusAuthEmail) window.focusAuthEmail();
+  HistoryGuard.resetToAuth();
+  if (showMessage) showToast("Logged out successfully.");
+}
+
+function goToAuthScreen(refresh = true) {
+  document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
+  const target = document.getElementById("screen-auth");
+  if (target) target.classList.add("active");
+  AppState.currentScreen = "auth";
+  document.querySelectorAll(".nav-item").forEach(btn => {
+    btn.classList.remove("active");
+    btn.classList.add("hidden");
+  });
+  const nav = document.getElementById("bottom-nav");
+  if (nav) nav.classList.add("hidden");
+  if (window.clearAuthFields) window.clearAuthFields();
+  if (window.focusAuthEmail) window.focusAuthEmail();
+  if (refresh) refreshUI();
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  SessionManager.resetForFreshStart();
+  loadState();
+  loadSession();
+  HistoryGuard.init();
+  HistoryGuard.resetToAuth();
+  initSplash();
+  setupWasteTypeSelectors();
+  initNavigation();
+  initAuth();
+  initAdminActions();
+  initGuide();
+  updateQtyUI();
+  refreshUI();
+});
+
+window.AppState = AppState;
+window.goTo = goTo;
+window.showToast = showToast;
+window.openLogModal = openLogModal;
+window.closeModal = closeModal;
+window.submitLog = submitLog;
+window.increaseQty = increaseQty;
+window.decreaseQty = decreaseQty;
+window.renderLeaderboard = renderLeaderboard;
+window.renderNotifications = renderNotifications;
+window.initGuide = initGuide;
+window.initRewards = initRewards;
+window.handleCollectorDecision = handleCollectorDecision;
+window.redeemReward = redeemReward;
+window.selectModalType = selectModalType;
+window.logout = logout;
