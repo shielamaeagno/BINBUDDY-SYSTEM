@@ -4,6 +4,159 @@
 
 const STORAGE_KEY = "binbuddy-state-v2";
 const SESSION_KEY = "binbuddy-session-v1";
+const API_BASE = (typeof window !== "undefined" && window.BINBUDDY_API_BASE) || "/api";
+const TOKEN_KEY = "binbuddy-jwt";
+
+let apiMode = false;
+let adminAnalyticsCache = null;
+
+/** Path routes (SPA, requires server to serve index for these paths when using HTTP) */
+const ROUTES = { LOGIN: "/login", DASHBOARD: "/dashboard" };
+let detachedLoginPhase = null;
+let suppressSplashTransitions = false;
+
+function pathRoutingEnabled() {
+  try {
+    const p = window.location.protocol;
+    return p === "http:" || p === "https:";
+  } catch (_e) {
+    return false;
+  }
+}
+
+function normalizePath(forPath) {
+  try {
+    let p =
+      forPath != null ? String(forPath).replace(/\/+$/, "") || "/" : String(window.location.pathname || "/").replace(/\/+$/, "") || "/";
+    if (p.endsWith("/index.html")) p = "/";
+    return p;
+  } catch (_e) {
+    return "/";
+  }
+}
+
+function setDashboardPhaseVisible(visible) {
+  const dash = document.getElementById("mount-dashboard-phase");
+  if (!dash) return;
+  dash.hidden = !visible;
+  if (visible) {
+    dash.removeAttribute("aria-hidden");
+    dash.removeAttribute("inert");
+  } else {
+    dash.setAttribute("aria-hidden", "true");
+    dash.setAttribute("inert", "");
+  }
+}
+
+function dashboardScreensDeactivateAll() {
+  document.querySelectorAll("#mount-dashboard-phase .screen").forEach(el => el.classList.remove("active"));
+}
+
+function showSplashOnly() {
+  document.querySelectorAll("#mount-login-phase .screen").forEach(el => el.classList.remove("active"));
+  document.getElementById("screen-splash")?.classList.add("active");
+}
+
+function showLoginFormOnly() {
+  document.querySelectorAll("#mount-login-phase .screen").forEach(el => el.classList.remove("active"));
+  document.getElementById("screen-auth")?.classList.add("active");
+}
+
+function detachLoginPhase() {
+  const el = document.getElementById("mount-login-phase");
+  if (!el?.parentNode) return;
+  detachedLoginPhase = el;
+  el.remove();
+}
+
+function attachLoginPhase() {
+  const app = document.getElementById("app");
+  const dash = document.getElementById("mount-dashboard-phase");
+  if (!app || !detachedLoginPhase) return;
+  if (detachedLoginPhase.parentNode === app) return;
+  app.insertBefore(detachedLoginPhase, dash);
+}
+
+function exitAuthenticatedMount() {
+  setDashboardPhaseVisible(false);
+  dashboardScreensDeactivateAll();
+  attachLoginPhase();
+  showLoginFormOnly();
+}
+
+function enterAuthenticatedMount() {
+  detachLoginPhase();
+  setDashboardPhaseVisible(true);
+}
+
+function historySyncAuthenticated(screen, replace = false) {
+  const state = { screen, authenticated: true };
+  if (!pathRoutingEnabled()) {
+    window.history[replace ? "replaceState" : "pushState"](state, "", window.location.href.split("#")[0]);
+    return;
+  }
+  window.history[replace ? "replaceState" : "pushState"](state, "", ROUTES.DASHBOARD);
+}
+
+function historySyncLogin() {
+  const state = { screen: "auth", authenticated: false };
+  if (!pathRoutingEnabled()) {
+    window.history.replaceState(state, "", window.location.href.split("#")[0]);
+    return;
+  }
+  window.history.replaceState(state, "", ROUTES.LOGIN);
+}
+
+function historySplashOnLoginRoute() {
+  if (!pathRoutingEnabled()) return;
+  window.history.replaceState({ screen: "splash", authenticated: false }, "", ROUTES.LOGIN);
+}
+
+function finalizeAuthenticatedEntry(firstScreen, { replaceHistory = true } = {}) {
+  suppressSplashTransitions = true;
+  enterAuthenticatedMount();
+  const screen = firstScreen || "home";
+  goTo(screen, { trackHistory: false, skipAuthenticatedHistory: true });
+  historySyncAuthenticated(screen, replaceHistory);
+}
+
+function runInitialUrlRouting(_restoredFromToken) {
+  const user = AuthService.currentUser();
+  const path = normalizePath();
+
+  if (user) {
+    suppressSplashTransitions = true;
+    let targetScreen =
+      history.state && history.state.screen ? history.state.screen : RoleGuard.getHomeScreen(user.role);
+    if (!RoleGuard.canAccess(user.role, targetScreen)) {
+      targetScreen = RoleGuard.getHomeScreen(user.role);
+    }
+    finalizeAuthenticatedEntry(targetScreen, { replaceHistory: true });
+    return;
+  }
+
+  setDashboardPhaseVisible(false);
+  dashboardScreensDeactivateAll();
+  attachLoginPhase();
+
+  if (!pathRoutingEnabled()) {
+    return;
+  }
+
+  if (path === ROUTES.DASHBOARD) {
+    suppressSplashTransitions = true;
+    window.history.replaceState({ screen: "auth", authenticated: false }, "", ROUTES.LOGIN);
+    showLoginFormOnly();
+    return;
+  }
+
+  if (path === ROUTES.LOGIN || path === "/") {
+    if (path === "/") window.history.replaceState({ screen: "splash", authenticated: false }, "", ROUTES.LOGIN);
+    return;
+  }
+
+  window.history.replaceState({ screen: "splash", authenticated: false }, "", ROUTES.LOGIN);
+}
 const ROLE_ALIASES = {
   user: "household",
   household: "household",
@@ -98,24 +251,45 @@ const RoleGuard = {
   }
 };
 
+function handlePopNavigate() {
+  const user = AuthService.currentUser();
+  const path = normalizePath();
+  const st = window.history.state || {};
+
+  if (!user) {
+    if (pathRoutingEnabled() && path === ROUTES.DASHBOARD) {
+      window.history.replaceState({ screen: "auth", authenticated: false }, "", ROUTES.LOGIN);
+    }
+    exitAuthenticatedMount();
+    dashboardScreensDeactivateAll();
+    const nav = document.getElementById("bottom-nav");
+    if (nav) nav.classList.add("hidden");
+    refreshUI();
+    const ae = document.getElementById("screen-auth");
+    if (ae) resetViewportScroll(ae);
+    return;
+  }
+
+  if (pathRoutingEnabled() && path === ROUTES.LOGIN) {
+    enterAuthenticatedMount();
+    historySyncAuthenticated(RoleGuard.getHomeScreen(user.role), true);
+  }
+
+  let safe = st.screen || RoleGuard.getHomeScreen(user.role);
+  if (!RoleGuard.canAccess(user.role, safe)) safe = RoleGuard.getHomeScreen(user.role);
+  goTo(safe, { trackHistory: false, skipAuthenticatedHistory: true });
+}
+
 const HistoryGuard = {
   init() {
-    window.addEventListener("popstate", () => {
-      const user = AuthService.currentUser();
-      if (!user) {
-        goToAuthScreen(false);
-        this.resetToAuth();
-        return;
-      }
-      const screen = (window.history.state && window.history.state.screen) || RoleGuard.getHomeScreen(user.role);
-      goTo(screen, { trackHistory: false });
-    });
+    window.addEventListener("popstate", handlePopNavigate);
   },
   push(screen) {
-    window.history.pushState({ screen }, "", window.location.href);
+    if (!AuthService.currentUser()) return;
+    historySyncAuthenticated(screen, false);
   },
-  resetToAuth() {
-    window.history.replaceState({ screen: "auth" }, "", window.location.href);
+  resetToLoginUrl() {
+    historySyncLogin();
   }
 };
 
@@ -125,6 +299,157 @@ function nowIso() {
 
 function formatDateTime(iso) {
   return new Date(iso).toLocaleString();
+}
+
+function getToken() {
+  return sessionStorage.getItem(TOKEN_KEY);
+}
+
+function setToken(t) {
+  if (t) sessionStorage.setItem(TOKEN_KEY, t);
+  else sessionStorage.removeItem(TOKEN_KEY);
+}
+
+function clearToken() {
+  sessionStorage.removeItem(TOKEN_KEY);
+}
+
+async function apiFetch(path, options = {}) {
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  const tok = getToken();
+  if (tok) headers.Authorization = `Bearer ${tok}`;
+  const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.message || res.statusText || "Request failed");
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+async function syncFromServer() {
+  const token = getToken();
+  if (!token) {
+    apiMode = false;
+    return false;
+  }
+  try {
+    const me = await apiFetch("/auth/me");
+    const user = me.user;
+    AppState.currentUserId = user.id;
+    AppState.currentUserName = user.name;
+    AppState.role = normalizeRole(user.role);
+
+    const logsData = await apiFetch("/logs");
+    AppState.logs = logsData.logs || [];
+
+    const notifData = await apiFetch("/notifications");
+    AppState.notifications = (notifData.notifications || []).map(n => ({
+      text: n.text,
+      createdAt: n.createdAt || n.created_at
+    }));
+
+    if (normalizeRole(user.role) === "household") {
+      const lb = await apiFetch("/leaderboard");
+      const rows = lb.leaderboard || [];
+      const mapped = rows.map(u => ({
+        id: u.id,
+        name: u.name,
+        email: u.id === user.id ? user.email || "" : "",
+        role: "household",
+        ecoPoints: u.ecoPoints,
+        streak: u.id === user.id ? user.streak : 0,
+        badge: u.id === user.id ? user.badge : "Eco Starter",
+        barangay: user.barangay || "Holy Spirit",
+        password: ""
+      }));
+      if (!mapped.some(u => u.id === user.id)) {
+        mapped.unshift({
+          id: user.id,
+          name: user.name,
+          email: user.email || "",
+          role: "household",
+          ecoPoints: user.ecoPoints,
+          streak: user.streak,
+          badge: user.badge,
+          barangay: user.barangay || "Holy Spirit",
+          password: ""
+        });
+      } else {
+        const idx = mapped.findIndex(u => u.id === user.id);
+        if (idx >= 0) {
+          mapped[idx] = {
+            ...mapped[idx],
+            ecoPoints: user.ecoPoints,
+            streak: user.streak,
+            badge: user.badge,
+            email: user.email || ""
+          };
+        }
+      }
+      AppState.users = mapped;
+    } else {
+      AppState.users = [
+        {
+          id: user.id,
+          name: user.name,
+          email: user.email || "",
+          role: user.role,
+          ecoPoints: user.ecoPoints || 0,
+          streak: user.streak || 0,
+          badge: user.badge || "",
+          barangay: user.barangay || "Holy Spirit",
+          password: ""
+        }
+      ];
+    }
+
+    if (normalizeRole(user.role) === "admin") {
+      adminAnalyticsCache = await apiFetch("/admin/analytics");
+    } else {
+      adminAnalyticsCache = null;
+    }
+
+    SessionManager.save({
+      currentUserId: AppState.currentUserId,
+      role: normalizeRole(AppState.role),
+      name: AppState.currentUserName
+    });
+
+    apiMode = true;
+    return true;
+  } catch (e) {
+    console.warn(e);
+    apiMode = false;
+    clearToken();
+    clearSession();
+    if (typeof clearRuntimeUserContext === "function") clearRuntimeUserContext();
+    return false;
+  }
+}
+
+function updateHomeStats() {
+  const user = AuthService.currentUser();
+  if (!user || normalizeRole(user.role) !== "household") return;
+  const logs = AppState.logs.filter(l => l.userId === user.id);
+  const today = new Date().toDateString();
+  let petToday = 0;
+  let hdpeToday = 0;
+  logs.forEach(l => {
+    if (new Date(l.createdAt).toDateString() !== today) return;
+    if (l.type === "PET") petToday += Number(l.weight) || 0;
+    if (l.type === "HDPE") hdpeToday += Number(l.weight) || 0;
+  });
+  const stats = document.querySelectorAll("#screen-home .stats-grid .stat-value");
+  if (stats[0]) stats[0].innerHTML = `${petToday.toFixed(1)}<span style="font-size:0.8rem">kg</span>`;
+  if (stats[1]) stats[1].innerHTML = `${hdpeToday.toFixed(1)}<span style="font-size:0.8rem">kg</span>`;
+  if (stats[2]) stats[2].textContent = user.ecoPoints;
+  if (stats[3]) stats[3].textContent = logs.length;
+
+  const streakEl = document.querySelector("#screen-home .welcome-banner div[style*='text-align:right'] div[style*='font-size:1.8rem']");
+  if (streakEl) streakEl.textContent = user.streak ?? 0;
 }
 
 function buildSeedState() {
@@ -196,6 +521,7 @@ function buildSeedState() {
 }
 
 function persistState() {
+  if (apiMode) return;
   localStorage.setItem(
     STORAGE_KEY,
     JSON.stringify({
@@ -270,11 +596,6 @@ function loadSession() {
 
 function getRoleHomeScreen(role) {
   return ROLE_HOME_SCREEN[normalizeRole(role)] || "home";
-}
-
-function getStartupScreen() {
-  // Enforce login gate on every startup.
-  return "auth";
 }
 
 const AuthService = {
@@ -450,23 +771,59 @@ const AnalyticsService = {
   }
 };
 
-function initSplash() {
+function resetViewportScroll(activeScreenEl) {
+  const flush = () => {
+    window.scrollTo(0, 0);
+    if (document.documentElement) document.documentElement.scrollTop = 0;
+    if (document.body) document.body.scrollTop = 0;
+    const app = document.getElementById("app");
+    if (app) app.scrollTop = 0;
+    if (activeScreenEl && activeScreenEl.scrollTop !== undefined) {
+      activeScreenEl.scrollTop = 0;
+    }
+  };
+  flush();
+  requestAnimationFrame(() => requestAnimationFrame(flush));
+}
+
+function initSplash(_restoredSession) {
   const splashScreen = document.getElementById("screen-splash");
-  const startupScreen = getStartupScreen();
-  if (!splashScreen) {
-    goTo(startupScreen);
+  if (!splashScreen && !AuthService.currentUser()) {
+    showLoginFormOnly();
     return;
   }
-  setTimeout(() => goTo(startupScreen), 1800);
+  if (!splashScreen) return;
+
+  if (suppressSplashTransitions || AuthService.currentUser()) {
+    return;
+  }
+
+  showSplashOnly();
+  if (pathRoutingEnabled()) {
+    historySplashOnLoginRoute();
+  }
+
+  setTimeout(() => {
+    if (AuthService.currentUser()) return;
+
+    showLoginFormOnly();
+    if (pathRoutingEnabled()) {
+      window.history.replaceState({ screen: "auth", authenticated: false }, "", ROUTES.LOGIN);
+    }
+    const ae = document.getElementById("screen-auth");
+    if (ae) resetViewportScroll(ae);
+  }, 1800);
 }
 
 function goTo(screen, options = {}) {
-  const { trackHistory = true } = options;
+  const { trackHistory = true, skipAuthenticatedHistory = false } = options;
   const user = AuthService.currentUser();
   if (screen !== "auth" && screen !== "splash" && !user) {
     showToast("Please login first.");
+    suppressSplashTransitions = true;
+    exitAuthenticatedMount();
     goToAuthScreen(false);
-    HistoryGuard.resetToAuth();
+    historySyncLogin();
     return;
   }
   if (user) {
@@ -486,11 +843,16 @@ function goTo(screen, options = {}) {
     return;
   }
 
-  document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
+  const dash = document.getElementById("mount-dashboard-phase");
+  dash?.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
   const target = document.getElementById(`screen-${screen}`);
-  if (target) target.classList.add("active");
+  if (!target || !dash || !dash.contains(target)) return;
+
+  target.classList.add("active");
   AppState.currentScreen = screen;
-  if (trackHistory) HistoryGuard.push(screen);
+  if (trackHistory && AuthService.currentUser() && !skipAuthenticatedHistory) {
+    HistoryGuard.push(screen);
+  }
   syncBottomNav(user, screen);
   const nav = document.getElementById("bottom-nav");
   if (nav) {
@@ -498,6 +860,7 @@ function goTo(screen, options = {}) {
     nav.classList.toggle("hidden", shouldHideNav);
   }
   refreshUI();
+  resetViewportScroll(target);
 }
 
 function syncBottomNav(user, screen) {
@@ -585,7 +948,7 @@ function getManualInputWeight() {
   return Number.isFinite(parsedQty) ? parsedQty : NaN;
 }
 
-function submitLog() {
+async function submitLog() {
   const user = AuthService.currentUser();
   if (!user || user.role !== "household") {
     showToast("Only household users can submit logs.");
@@ -596,6 +959,29 @@ function submitLog() {
   if (error) {
     showToast(error);
     return;
+  }
+  if (apiMode && getToken()) {
+    try {
+      const notesEl = document.querySelector("#manual-panel textarea");
+      const notes = notesEl ? notesEl.value.trim() : "";
+      const payload = {
+        wasteType: AppState.logType,
+        weight,
+        notes
+      };
+      const created = await apiFetch("/logs", {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+      closeModal("log-modal");
+      openSuccessModal(created.log);
+      await syncFromServer();
+      refreshUI();
+      return;
+    } catch (e) {
+      showToast(e.message || "Could not submit log.");
+      return;
+    }
   }
   const log = WasteLogService.createLog({ user, rawType: AppState.logType, weight });
   closeModal("log-modal");
@@ -644,7 +1030,7 @@ function renderNotifications() {
   el.innerHTML = AppState.notifications.slice(0, 20).map(n => `
     <div class="card">
       ${n.text}<br/>
-      <small>${formatDateTime(n.createdAt)}</small>
+      <small>${formatDateTime(n.createdAt || n.created_at)}</small>
     </div>
   `).join("");
 }
@@ -710,11 +1096,26 @@ function renderCollectorView() {
   if (statValues[3]) statValues[3].textContent = metrics.pendingLogs;
 }
 
-function handleCollectorDecision(logId, isVerified) {
+async function handleCollectorDecision(logId, isVerified) {
   const user = AuthService.currentUser();
   if (!user || user.role !== "collector") {
     showToast("Collector login required.");
     return;
+  }
+  if (apiMode && getToken()) {
+    try {
+      await apiFetch(`/logs/${encodeURIComponent(logId)}/verify`, {
+        method: "PATCH",
+        body: JSON.stringify({ approve: Boolean(isVerified) })
+      });
+      await syncFromServer();
+      showToast(isVerified ? "Log marked as Completed." : "Status kept as Pending.");
+      refreshUI();
+      return;
+    } catch (e) {
+      showToast(e.message || "Verification failed.");
+      return;
+    }
   }
   const updated = VerificationService.verifyLog(logId, isVerified, user.id);
   if (!updated) {
@@ -726,6 +1127,50 @@ function handleCollectorDecision(logId, isVerified) {
 }
 
 function renderAdminAnalytics() {
+  if (apiMode && adminAnalyticsCache && adminAnalyticsCache.metrics) {
+    const m = adminAnalyticsCache.metrics;
+    const kpis = document.querySelectorAll("#screen-admin .kpi-card .kpi-value");
+    if (kpis[0]) kpis[0].textContent = `${m.totalCollectedKg}kg`;
+    if (kpis[1]) kpis[1].textContent = `${m.compliance}%`;
+    if (kpis[2]) kpis[2].textContent = `${m.recyclingRate}%`;
+    if (kpis[3]) kpis[3].textContent = `${m.activeHouseholds}`;
+
+    const pointsNode = document.querySelector("#screen-admin .card.mb-12 .section-title + div");
+    if (pointsNode) pointsNode.textContent = `${m.ecoPointsDistributed}`;
+
+    const adminUsers = document.getElementById("admin-users");
+    if (adminUsers && adminAnalyticsCache.topHouseholds) {
+      adminUsers.innerHTML = adminAnalyticsCache.topHouseholds
+        .map(
+          u => `
+      <div class="card" style="display:flex;justify-content:space-between">
+        <span>#${u.rank} ${u.name}</span>
+        <strong>${u.ecoPoints} pts</strong>
+      </div>
+    `
+        )
+        .join("");
+    }
+
+    const chart = document.getElementById("admin-chart");
+    if (chart && adminAnalyticsCache.weeklyChart) {
+      const data = adminAnalyticsCache.weeklyChart;
+      const max = Math.max(...data.map(d => d.val), 1);
+      chart.innerHTML = data
+        .map(
+          d => `
+      <div class="chart-col">
+        <div class="chart-val">${d.val}</div>
+        <div class="chart-bar" style="height:${(d.val / max) * 80}px"></div>
+        <div class="chart-label">${d.day}</div>
+      </div>
+    `
+        )
+        .join("");
+    }
+    return;
+  }
+
   const metrics = AnalyticsService.metrics();
   const kpis = document.querySelectorAll("#screen-admin .kpi-card .kpi-value");
   if (kpis[0]) kpis[0].textContent = `${metrics.totalCollectedKg}kg`;
@@ -733,8 +1178,10 @@ function renderAdminAnalytics() {
   if (kpis[2]) kpis[2].textContent = `${metrics.completedLogs}`;
   if (kpis[3]) kpis[3].textContent = `${AppState.users.filter(u => u.role === "household").length}`;
 
-  const pointsNode = document.querySelector("#screen-admin .card .section-title + div");
-  if (pointsNode) pointsNode.textContent = `${metrics.ecoPointsDistributed}`;
+  const pointsNodeLocal =
+    document.querySelector("#screen-admin .card.mb-12 .section-title + div") ||
+    document.querySelector("#screen-admin .card .section-title + div");
+  if (pointsNodeLocal) pointsNodeLocal.textContent = `${metrics.ecoPointsDistributed}`;
 
   const adminUsers = document.getElementById("admin-users");
   if (adminUsers) {
@@ -785,19 +1232,53 @@ function initGuide() {
 function initRewards() {
   const grid = document.getElementById("rewards-grid");
   if (!grid) return;
-  grid.innerHTML = RewardsService.catalog().map(r => `
+  const paint = catalog => {
+    grid.innerHTML = catalog
+      .map(r => `
     <div class="card" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
       <div><strong>${r.display}</strong><br/><small>${r.cost} pts</small></div>
       <button class="btn btn-outline" onclick="redeemReward('${r.id}')">Redeem</button>
     </div>
-  `).join("");
+  `)
+      .join("");
+  };
+  if (apiMode && getToken()) {
+    apiFetch("/rewards")
+      .then(res => {
+        paint(
+          (res.rewards || []).map(r => ({
+            id: r.id,
+            display: r.display,
+            cost: r.cost
+          }))
+        );
+      })
+      .catch(() => paint(RewardsService.catalog()));
+    return;
+  }
+  paint(RewardsService.catalog());
 }
 
-function redeemReward(rewardId) {
+async function redeemReward(rewardId) {
   const user = AuthService.currentUser();
   if (!user || user.role !== "household") {
     showToast("Only household users can redeem rewards.");
     return;
+  }
+  if (apiMode && getToken()) {
+    try {
+      const result = await apiFetch("/rewards/redeem", {
+        method: "POST",
+        body: JSON.stringify({ rewardId })
+      });
+      await syncFromServer();
+      showToast(`Redeemed: ${result.reward.display}`);
+      refreshUI();
+      return;
+    } catch (e) {
+      showToast(e.message || "Redemption failed.");
+      return;
+    }
   }
   const result = RewardsService.redeem(rewardId, user);
   if (!result.ok) {
@@ -854,7 +1335,7 @@ function initAuth() {
   });
 
   if (loginBtn) {
-    loginBtn.addEventListener("click", () => {
+    loginBtn.addEventListener("click", async () => {
       const email = (emailInput ? emailInput.value : "").trim();
       const password = passwordInput ? passwordInput.value : "";
       if (!email || !password) {
@@ -862,36 +1343,88 @@ function initAuth() {
         return;
       }
       if (AppState.authMode === "register") {
-        const reg = AuthService.register({ email, password, role: AppState.role });
-        if (!reg.ok) {
-          showToast(reg.message);
+        if (normalizeRole(AppState.role) !== "household") {
+          showToast("Registration is for household users only. Use Login for collector or admin.");
+          return;
+        }
+        try {
+          const reg = await apiFetch("/auth/register", {
+            method: "POST",
+            body: JSON.stringify({
+              email,
+              password,
+              name: email.split("@")[0].replace(/\./g, " ")
+            })
+          });
+          setToken(reg.token);
+          await syncFromServer();
+          finalizeAuthenticatedEntry("home", { replaceHistory: true });
+          showToast(`Welcome, ${reg.user.name}`);
+          return;
+        } catch (e) {
+          const reg = AuthService.register({ email, password, role: "household" });
+          if (!reg.ok) {
+            showToast(e.message || reg.message);
+            return;
+          }
+          const locLogin = AuthService.login({ email, password, role: "household" });
+          if (!locLogin.ok) {
+            showToast(locLogin.message);
+            return;
+          }
+          finalizeAuthenticatedEntry("home", { replaceHistory: true });
+          showToast(`Welcome, ${locLogin.user.name}`);
           return;
         }
       }
-      const login = AuthService.login({ email, password, role: AppState.role });
-      if (!login.ok) {
-        showToast(login.message);
+      try {
+        const login = await apiFetch("/auth/login", {
+          method: "POST",
+          body: JSON.stringify({
+            email,
+            password,
+            role: normalizeRole(AppState.role)
+          })
+        });
+        setToken(login.token);
+        await syncFromServer();
+        const targetScreen = getRoleHomeScreen(login.user.role);
+        finalizeAuthenticatedEntry(targetScreen, { replaceHistory: true });
+        showToast(`Welcome, ${login.user.name}`);
         return;
+      } catch (e) {
+        const login = AuthService.login({ email, password, role: AppState.role });
+        if (!login.ok) {
+          showToast(e.message || login.message);
+          return;
+        }
+        const targetScreen = getRoleHomeScreen(login.user.role);
+        finalizeAuthenticatedEntry(targetScreen, { replaceHistory: true });
+        showToast(`Welcome, ${login.user.name}`);
       }
-      const targetScreen = getRoleHomeScreen(login.user.role);
-      goTo(targetScreen);
-      showToast(`Welcome, ${login.user.name}`);
-      refreshUI();
     });
   }
 
   if (guestBtn) {
-    guestBtn.addEventListener("click", () => {
-      const guest = AppState.users.find(u => u.role === "household");
-      if (guest) {
-        AppState.currentUserId = guest.id;
-        AppState.currentUserName = guest.name || "User";
-        AppState.role = normalizeRole(guest.role);
-        persistSession();
+    guestBtn.addEventListener("click", async () => {
+      try {
+        const g = await apiFetch("/auth/guest", { method: "POST", body: "{}" });
+        setToken(g.token);
+        await syncFromServer();
+        finalizeAuthenticatedEntry("home", { replaceHistory: true });
+        showToast("Guest household mode");
+        return;
+      } catch (_e) {
+        const guest = AppState.users.find(u => u.role === "household");
+        if (guest) {
+          AppState.currentUserId = guest.id;
+          AppState.currentUserName = guest.name || "User";
+          AppState.role = normalizeRole(guest.role);
+          persistSession();
+        }
+        finalizeAuthenticatedEntry("home", { replaceHistory: true });
+        showToast("Guest household mode");
       }
-      goTo("home");
-      showToast("Guest household mode");
-      refreshUI();
     });
   }
 }
@@ -899,11 +1432,31 @@ function initAuth() {
 function initAdminActions() {
   const exportBtn = document.getElementById("btn-export");
   if (!exportBtn) return;
-  exportBtn.addEventListener("click", () => {
+  exportBtn.addEventListener("click", async () => {
     const user = AuthService.currentUser();
     if (!user || user.role !== "admin") {
       showToast("Admin access only.");
       return;
+    }
+    if (apiMode && getToken()) {
+      try {
+        const res = await fetch(`${API_BASE}/admin/export.csv`, {
+          headers: { Authorization: `Bearer ${getToken()}` }
+        });
+        if (!res.ok) throw new Error("Export failed.");
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "binbuddy-waste-logs.csv";
+        a.click();
+        URL.revokeObjectURL(url);
+        showToast("CSV downloaded.");
+        return;
+      } catch (e) {
+        showToast(e.message || "Export failed.");
+        return;
+      }
     }
     showToast("CSV export generated.");
   });
@@ -947,7 +1500,7 @@ function initNavigation() {
 
   const submitBtn = document.getElementById("btn-submit-log");
   if (submitBtn) {
-    submitBtn.addEventListener("click", () => {
+    submitBtn.addEventListener("click", async () => {
       const user = AuthService.currentUser();
       if (!user || user.role !== "household") {
         showToast("Only household users can submit logs.");
@@ -960,7 +1513,7 @@ function initNavigation() {
         return;
       }
       AppState.logQty = weight;
-      submitLog();
+      await submitLog();
     });
   }
 }
@@ -983,6 +1536,7 @@ function selectModalType(type, el) {
 function refreshUI() {
   renderHomeGreeting();
   renderProfile();
+  updateHomeStats();
   renderRecentLogs();
   renderNotifications();
   renderCollectorView();
@@ -1005,19 +1559,25 @@ function logout(showMessage = true, requireConfirmation = false) {
   if (requireConfirmation && !window.confirm("Are you sure you want to logout?")) {
     return;
   }
+  clearToken();
+  apiMode = false;
+  adminAnalyticsCache = null;
   SessionManager.clearAppCache();
   clearRuntimeUserContext();
   clearSession();
   loadState();
+  suppressSplashTransitions = false;
+  exitAuthenticatedMount();
   goToAuthScreen(false);
   if (window.clearAuthFields) window.clearAuthFields();
   if (window.focusAuthEmail) window.focusAuthEmail();
-  HistoryGuard.resetToAuth();
+  historySyncLogin();
   if (showMessage) showToast("Logged out successfully.");
 }
 
 function goToAuthScreen(refresh = true) {
-  document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
+  document.querySelectorAll("#mount-login-phase .screen").forEach(el => el.classList.remove("active"));
+  dashboardScreensDeactivateAll();
   const target = document.getElementById("screen-auth");
   if (target) target.classList.add("active");
   AppState.currentScreen = "auth";
@@ -1030,15 +1590,22 @@ function goToAuthScreen(refresh = true) {
   if (window.clearAuthFields) window.clearAuthFields();
   if (window.focusAuthEmail) window.focusAuthEmail();
   if (refresh) refreshUI();
+  resetViewportScroll(target || document.getElementById("screen-auth"));
 }
 
-document.addEventListener("DOMContentLoaded", () => {
-  SessionManager.resetForFreshStart();
+document.addEventListener("DOMContentLoaded", async () => {
   loadState();
   loadSession();
   HistoryGuard.init();
-  HistoryGuard.resetToAuth();
-  initSplash();
+
+  let restored = false;
+  if (getToken()) {
+    restored = await syncFromServer();
+  }
+
+  runInitialUrlRouting(restored);
+
+  initSplash(restored);
   setupWasteTypeSelectors();
   initNavigation();
   initAuth();

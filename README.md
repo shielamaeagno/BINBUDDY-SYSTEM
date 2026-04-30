@@ -217,4 +217,31 @@ Full schema in `/sql/binbuddy-schema.sql`:
 
 ---
 
+## 🔧 Full-stack backend (API + SQLite)
+
+The repository includes a Node.js REST API with JWT authentication, role-based routes, and persistent SQLite storage (`server/data/binbuddy.db`). The existing web UI in `index.html` is unchanged; `js/app.js` talks to `/api` when the app is served from the server.
+
+### Run locally
+
+```bash
+cd server
+cp .env.example .env   # set JWT_SECRET to a long random string in production
+npm install
+npm start
+```
+
+Open **http://localhost:3000** (API routes are under `/api`). Seed accounts after first boot:
+
+| Role | Email | Password |
+|------|--------|----------|
+| Household | maria@email.com | password123 |
+| Collector | collector@email.com | password123 |
+| Admin | admin@email.com | password123 |
+
+New registrations create **household** accounts only (collector/admin accounts are seeded or provisioned separately). **Continue as Guest** signs in as the demo household when `ALLOW_GUEST_LOGIN` is not `false`.
+
+Optional: override the API URL from the browser with `window.BINBUDDY_API_BASE = 'https://your-host/api'` before loading `js/app.js`.
+
+---
+
 *BinBuddy v1.0 · © 2026 · Powerpuff w/ Mojo Jojo · Made with 💚 for the Philippines*
