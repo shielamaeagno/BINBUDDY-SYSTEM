@@ -28,49 +28,61 @@
   </section>
 
   <!-- ====================================================
-       AUTH SCREEN
+       AUTH SCREEN (split layout: brand | forms)
   ==================================================== -->
-  <section id="screen-auth" class="screen">
-    <div class="auth-header">
-      <div class="auth-header-logo">♻️ Bin<span>Buddy</span></div>
-      <p>Smart waste tracking for a cleaner Lipa City</p>
-    </div>
-    <div class="auth-body">
-      <!-- Tabs -->
-      <div class="auth-tabs">
-        <button class="auth-tab active">Login</button>
-        <button class="auth-tab">Register</button>
-      </div>
-      <!-- Email -->
-      <div class="form-group">
-        <label>Email / Mobile Number</label>
-        <input class="form-control" type="text" placeholder="email@example.com" value="" autocomplete="off"/>
-      </div>
-      <!-- Password -->
-      <div class="form-group">
-        <label>Password</label>
-        <input class="form-control" type="password" placeholder="Enter your password" value="" autocomplete="new-password"/>
-      </div>
-      <!-- Role Selection -->
-      <label style="font-weight:600;font-size:0.87rem;display:block;margin-bottom:8px;">Select your role</label>
-      <div class="role-selector">
-        <div class="role-card selected" data-role="household">
-          <div class="role-icon">🏠</div>
-          <div class="role-label">Household</div>
+  <section id="screen-auth" class="screen" aria-label="Sign in">
+    <div class="auth-split">
+      <aside class="auth-split-brand">
+        <div class="auth-brand-stack">
+          <img
+            class="auth-brand-logo"
+            src="assets/binbuddy-logo.png"
+            alt="BinBuddy logo"
+          />
+          <h1 class="auth-split-brand-title">BinBuddy</h1>
+          <p class="auth-brand-slogan">SCAN • SORT • EARN</p>
+          <p class="auth-brand-tagline">Smart waste tracking for a cleaner Lipa City</p>
         </div>
-        <div class="role-card" data-role="collector">
-          <div class="role-icon">🚛</div>
-          <div class="role-label">Collector</div>
-        </div>
-        <div class="role-card" data-role="admin">
-          <div class="role-icon">🏢</div>
-          <div class="role-label">Admin</div>
-        </div>
+      </aside>
+      <div class="auth-split-panel">
+        <form class="auth-panel-inner" id="auth-form" novalidate autocomplete="on">
+          <div class="auth-tabs" role="tablist" aria-label="Login or Register">
+            <button type="button" class="auth-tab active" role="tab" aria-selected="true">Login</button>
+            <button type="button" class="auth-tab" role="tab" aria-selected="false">Register</button>
+          </div>
+          <div class="form-group">
+            <label for="auth-email">Email</label>
+            <input id="auth-email" name="email" class="form-control" type="email" inputmode="email" maxlength="254" autocomplete="username" spellcheck="false" placeholder="you@example.com" required/>
+            <p class="field-error" id="auth-email-error" aria-live="polite"></p>
+          </div>
+          <div class="form-group">
+            <label for="auth-password">Password</label>
+            <div class="password-input-wrap">
+              <input id="auth-password" name="password" class="form-control has-toggle" type="password" maxlength="128" autocomplete="current-password" placeholder="Enter password" required/>
+              <button type="button" class="password-toggle" id="auth-password-toggle" aria-label="Show password" aria-pressed="false">👁️</button>
+            </div>
+            <p class="field-error" id="auth-password-error" aria-live="polite"></p>
+          </div>
+          <p class="auth-password-hint" id="auth-password-hint">Use at least 8 characters with letters and numbers.</p>
+          <label class="auth-role-heading">Select your role</label>
+          <div class="role-selector" role="group" aria-label="Account role">
+            <button type="button" class="role-card selected" data-role="household" aria-pressed="true">
+              <span class="role-icon" aria-hidden="true">🏠</span>
+              <span class="role-label">Household</span>
+            </button>
+            <button type="button" class="role-card" data-role="collector" aria-pressed="false">
+              <span class="role-icon" aria-hidden="true">🚛</span>
+              <span class="role-label">Collector</span>
+            </button>
+            <button type="button" class="role-card" data-role="admin" aria-pressed="false">
+              <span class="role-icon" aria-hidden="true">🏢</span>
+              <span class="role-label">Admin</span>
+            </button>
+          </div>
+          <button type="submit" class="btn btn-primary" id="btn-login">Login to BinBuddy</button>
+          <p class="auth-foot-note">🔒 Sessions use signed tokens. Passwords stored hashed.</p>
+        </form>
       </div>
-      <button class="btn btn-primary" id="btn-login">Login to BinBuddy</button>
-      <div class="divider">or</div>
-      <button class="btn btn-outline" id="btn-guest">Continue as Guest 👋</button>
-      <p class="text-muted text-center mt-8" style="font-size:0.78rem">🔒 Your data is safe with BinBuddy</p>
     </div>
   </section>
 

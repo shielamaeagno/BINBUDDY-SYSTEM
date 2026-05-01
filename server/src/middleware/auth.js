@@ -3,7 +3,7 @@ import jwt from "jsonwebtoken";
 const JWT_SECRET = process.env.JWT_SECRET || "dev-only-change-in-production";
 
 export function signToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: "7d" });
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: "7d", algorithm: "HS256" });
 }
 
 export function requireAuth(req, res, next) {
@@ -13,7 +13,7 @@ export function requireAuth(req, res, next) {
     return res.status(401).json({ ok: false, message: "Authentication required." });
   }
   try {
-    req.auth = jwt.verify(token, JWT_SECRET);
+    req.auth = jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"] });
     return next();
   } catch {
     return res.status(401).json({ ok: false, message: "Invalid or expired session." });

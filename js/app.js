@@ -7,6 +7,38 @@ const SESSION_KEY = "binbuddy-session-v1";
 const API_BASE = (typeof window !== "undefined" && window.BINBUDDY_API_BASE) || "/api";
 const TOKEN_KEY = "binbuddy-jwt";
 
+/** Align with server `passwordPolicy`: 8–128 chars, letters + numbers. */
+const AUTH_PASSWORD_REGEX = /^(?=.*[A-Za-z])(?=.*\d).{8,128}$/;
+
+function validateRegisterPasswordClient(pw) {
+  if (!AUTH_PASSWORD_REGEX.test(pw)) {
+    return "Password must be 8–128 characters and include at least one letter and one number.";
+  }
+  return "";
+}
+
+function validateLoginPasswordPresence(pw) {
+  if (!pw || typeof pw !== "string") return "Password is required.";
+  if (pw.length > 128) return "Password is too long.";
+  return "";
+}
+
+function sanitizeRegisterName(email, derived) {
+  const raw = (derived || "").trim() || email.split("@")[0].replace(/[.@]+/g, " ").trim() || "User";
+  return raw.slice(0, 100);
+}
+
+function summarizeApiValidationMessage(data) {
+  const errs = data?.errors;
+  if (!Array.isArray(errs) || errs.length === 0) return null;
+  const row = errs.find(e => e && typeof e.msg === "string" && e.msg.trim());
+  return row ? row.msg : null;
+}
+
+function setViewportAuthLock(locked) {
+  document.getElementById("app")?.classList.toggle("bb-auth-lock", !!locked);
+}
+
 let apiMode = false;
 let adminAnalyticsCache = null;
 
@@ -53,11 +85,13 @@ function dashboardScreensDeactivateAll() {
 }
 
 function showSplashOnly() {
+  setViewportAuthLock(true);
   document.querySelectorAll("#mount-login-phase .screen").forEach(el => el.classList.remove("active"));
   document.getElementById("screen-splash")?.classList.add("active");
 }
 
 function showLoginFormOnly() {
+  setViewportAuthLock(true);
   document.querySelectorAll("#mount-login-phase .screen").forEach(el => el.classList.remove("active"));
   document.getElementById("screen-auth")?.classList.add("active");
 }
@@ -87,6 +121,7 @@ function exitAuthenticatedMount() {
 function enterAuthenticatedMount() {
   detachLoginPhase();
   setDashboardPhaseVisible(true);
+  setViewportAuthLock(false);
 }
 
 function historySyncAuthenticated(screen, replace = false) {
@@ -150,8 +185,17 @@ function runInitialUrlRouting(_restoredFromToken) {
     return;
   }
 
-  if (path === ROUTES.LOGIN || path === "/") {
-    if (path === "/") window.history.replaceState({ screen: "splash", authenticated: false }, "", ROUTES.LOGIN);
+  /** Bookmarked `/login`: show split auth immediately (logged-in users already redirected above). */
+  if (path === ROUTES.LOGIN && pathRoutingEnabled()) {
+    suppressSplashTransitions = true;
+    showLoginFormOnly();
+    return;
+  }
+
+  if (path === "/") {
+    if (pathRoutingEnabled()) {
+      window.history.replaceState({ screen: "splash", authenticated: false }, "", ROUTES.LOGIN);
+    }
     return;
   }
 
@@ -321,7 +365,8 @@ async function apiFetch(path, options = {}) {
   const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const err = new Error(data.message || res.statusText || "Request failed");
+    const detail = summarizeApiValidationMessage(data) || data.message;
+    const err = new Error(detail || res.statusText || "Request failed");
     err.status = res.status;
     err.data = data;
     throw err;
@@ -601,6 +646,8 @@ function getRoleHomeScreen(role) {
 const AuthService = {
   register(payload) {
     const { email, password, role } = payload;
+    const pwErr = validateRegisterPasswordClient(password);
+    if (pwErr) return { ok: false, message: pwErr };
     const existing = AppState.users.find(u => u.email.toLowerCase() === email.toLowerCase() && u.role === role);
     if (existing) return { ok: false, message: "Account already exists for this role." };
     const idPrefix = role === "collector" ? "COL" : role === "admin" ? "ADM" : "USR";
@@ -1291,14 +1338,42 @@ async function redeemReward(rewardId) {
 
 function initAuth() {
   const loginBtn = document.getElementById("btn-login");
-  const guestBtn = document.getElementById("btn-guest");
+  const authForm = document.getElementById("auth-form");
   const authTabs = document.querySelectorAll(".auth-tab");
   const roleCards = document.querySelectorAll(".role-card");
   const authPrimaryButton = document.getElementById("btn-login");
-  const authSubtitle = document.querySelector("#screen-auth .auth-header p");
-  const inputs = document.querySelectorAll("#screen-auth .form-control");
-  const emailInput = inputs[0];
-  const passwordInput = inputs[1];
+  const screenAuth = document.getElementById("screen-auth");
+  const emailInput = document.getElementById("auth-email");
+  const passwordInput = document.getElementById("auth-password");
+  const passwordToggleBtn = document.getElementById("auth-password-toggle");
+  const emailError = document.getElementById("auth-email-error");
+  const passwordError = document.getElementById("auth-password-error");
+
+  const setFieldError = (inputEl, errorEl, message) => {
+    if (!inputEl || !errorEl) return;
+    const text = message ? String(message).trim() : "";
+    errorEl.textContent = text;
+    inputEl.classList.toggle("is-invalid", Boolean(text));
+  };
+
+  const clearInlineErrors = () => {
+    setFieldError(emailInput, emailError, "");
+    setFieldError(passwordInput, passwordError, "");
+  };
+
+  const syncPasswordAutocomplete = () => {
+    if (passwordInput)
+      passwordInput.setAttribute(
+        "autocomplete",
+        AppState.authMode === "register" ? "new-password" : "current-password"
+      );
+  };
+
+  const syncAuthModeChrome = () => {
+    if (screenAuth) screenAuth.classList.toggle("auth-mode-register", AppState.authMode === "register");
+    syncPasswordAutocomplete();
+  };
+
   const clearAuthFields = () => {
     if (emailInput) emailInput.value = "";
     if (passwordInput) passwordInput.value = "";
@@ -1309,124 +1384,160 @@ function initAuth() {
   window.clearAuthFields = clearAuthFields;
   window.focusAuthEmail = focusAuthEmail;
   clearAuthFields();
+  clearInlineErrors();
+  syncAuthModeChrome();
+
+  emailInput?.addEventListener("input", () => setFieldError(emailInput, emailError, ""));
+  passwordInput?.addEventListener("input", () => setFieldError(passwordInput, passwordError, ""));
+
+  passwordToggleBtn?.addEventListener("click", () => {
+    if (!passwordInput) return;
+    const reveal = passwordInput.type === "password";
+    passwordInput.type = reveal ? "text" : "password";
+    passwordToggleBtn.setAttribute("aria-pressed", String(reveal));
+    passwordToggleBtn.setAttribute("aria-label", reveal ? "Hide password" : "Show password");
+    passwordToggleBtn.textContent = reveal ? "🙈" : "👁️";
+    passwordInput.focus();
+  });
 
   authTabs.forEach((tab, idx) => {
     tab.addEventListener("click", () => {
-      authTabs.forEach(t => t.classList.remove("active"));
-      tab.classList.add("active");
+      authTabs.forEach((t, i) => {
+        t.classList.toggle("active", i === idx);
+        t.setAttribute("aria-selected", String(i === idx));
+      });
       AppState.authMode = idx === 1 ? "register" : "login";
+      syncAuthModeChrome();
+      clearInlineErrors();
       if (authPrimaryButton) {
         authPrimaryButton.textContent = AppState.authMode === "register" ? "Create BinBuddy Account" : "Login to BinBuddy";
-      }
-      if (authSubtitle) {
-        authSubtitle.textContent = AppState.authMode === "register"
-          ? "Create your account and start earning EcoPoints"
-          : "Smart waste tracking for a cleaner Lipa City";
       }
     });
   });
 
   roleCards.forEach(card => {
     card.addEventListener("click", () => {
-      roleCards.forEach(c => c.classList.remove("selected"));
+      roleCards.forEach(c => {
+        c.classList.remove("selected");
+        c.setAttribute("aria-pressed", "false");
+      });
       card.classList.add("selected");
+      card.setAttribute("aria-pressed", "true");
       AppState.role = normalizeRole(card.dataset.role);
     });
   });
 
-  if (loginBtn) {
-    loginBtn.addEventListener("click", async () => {
-      const email = (emailInput ? emailInput.value : "").trim();
-      const password = passwordInput ? passwordInput.value : "";
-      if (!email || !password) {
-        showToast("Email and password are required.");
+  const submitAuth = async () => {
+    clearInlineErrors();
+    const email = (emailInput ? emailInput.value : "").trim();
+    const password = passwordInput ? passwordInput.value : "";
+    if (!email || !email.includes("@")) {
+      setFieldError(emailInput, emailError, "Please enter a valid email address");
+      emailInput?.focus();
+      return;
+    }
+    if (email.includes(" ")) {
+      setFieldError(emailInput, emailError, "Please enter a valid email address");
+      emailInput?.focus();
+      return;
+    }
+
+    const loginPwErr = validateLoginPasswordPresence(password);
+    if (loginPwErr && AppState.authMode === "login") {
+      setFieldError(passwordInput, passwordError, loginPwErr);
+      passwordInput?.focus();
+      return;
+    }
+    if (AppState.authMode === "register") {
+      const rp = validateRegisterPasswordClient(password);
+      if (rp) {
+        setFieldError(passwordInput, passwordError, "Password must be at least 8 characters with letters and numbers");
+        passwordInput?.focus();
         return;
       }
-      if (AppState.authMode === "register") {
-        if (normalizeRole(AppState.role) !== "household") {
-          showToast("Registration is for household users only. Use Login for collector or admin.");
-          return;
-        }
-        try {
-          const reg = await apiFetch("/auth/register", {
-            method: "POST",
-            body: JSON.stringify({
-              email,
-              password,
-              name: email.split("@")[0].replace(/\./g, " ")
-            })
-          });
-          setToken(reg.token);
-          await syncFromServer();
-          finalizeAuthenticatedEntry("home", { replaceHistory: true });
-          showToast(`Welcome, ${reg.user.name}`);
-          return;
-        } catch (e) {
-          const reg = AuthService.register({ email, password, role: "household" });
-          if (!reg.ok) {
-            showToast(e.message || reg.message);
-            return;
-          }
-          const locLogin = AuthService.login({ email, password, role: "household" });
-          if (!locLogin.ok) {
-            showToast(locLogin.message);
-            return;
-          }
-          finalizeAuthenticatedEntry("home", { replaceHistory: true });
-          showToast(`Welcome, ${locLogin.user.name}`);
-          return;
-        }
-      }
+    }
+
+    if (AppState.authMode === "register") {
+      const registrationRole = normalizeRole(AppState.role);
+      const displayName = sanitizeRegisterName(email);
       try {
-        const login = await apiFetch("/auth/login", {
+        const reg = await apiFetch("/auth/register", {
           method: "POST",
           body: JSON.stringify({
             email,
             password,
-            role: normalizeRole(AppState.role)
+            name: displayName,
+            role: registrationRole
           })
         });
-        setToken(login.token);
+        setToken(reg.token);
         await syncFromServer();
-        const targetScreen = getRoleHomeScreen(login.user.role);
-        finalizeAuthenticatedEntry(targetScreen, { replaceHistory: true });
-        showToast(`Welcome, ${login.user.name}`);
+        const regHome = getRoleHomeScreen(reg.user.role);
+        finalizeAuthenticatedEntry(regHome, { replaceHistory: true });
+        showToast(`Welcome, ${reg.user.name}`);
         return;
       } catch (e) {
-        const login = AuthService.login({ email, password, role: AppState.role });
-        if (!login.ok) {
-          showToast(e.message || login.message);
+        console.warn("[auth] register rejected or api failed — check server logs.", e?.message || e, e?.data || "");
+        const reg = AuthService.register({
+          email,
+          password,
+          name: displayName,
+          role: registrationRole
+        });
+        if (!reg.ok) {
+          showToast(e.message || reg.message);
           return;
         }
-        const targetScreen = getRoleHomeScreen(login.user.role);
-        finalizeAuthenticatedEntry(targetScreen, { replaceHistory: true });
-        showToast(`Welcome, ${login.user.name}`);
+        const locLogin = AuthService.login({ email, password, role: registrationRole });
+        if (!locLogin.ok) {
+          showToast(locLogin.message);
+          return;
+        }
+        finalizeAuthenticatedEntry(getRoleHomeScreen(locLogin.user.role), { replaceHistory: true });
+        showToast(`Welcome, ${locLogin.user.name}`);
+        return;
       }
+    }
+
+    try {
+      const login = await apiFetch("/auth/login", {
+        method: "POST",
+        body: JSON.stringify({
+          email,
+          password,
+          role: normalizeRole(AppState.role)
+        })
+      });
+      setToken(login.token);
+      await syncFromServer();
+      const targetScreen = getRoleHomeScreen(login.user.role);
+      finalizeAuthenticatedEntry(targetScreen, { replaceHistory: true });
+      showToast(`Welcome, ${login.user.name}`);
+      return;
+    } catch (e) {
+      const loginFallback = AuthService.login({ email, password, role: normalizeRole(AppState.role) });
+      if (!loginFallback.ok) {
+        showToast(e.message || loginFallback.message);
+        return;
+      }
+      const targetScreen = getRoleHomeScreen(loginFallback.user.role);
+      finalizeAuthenticatedEntry(targetScreen, { replaceHistory: true });
+      showToast(`Welcome, ${loginFallback.user.name}`);
+    }
+  };
+
+  authForm?.addEventListener("submit", ev => {
+    ev.preventDefault();
+    submitAuth();
+  });
+
+  if (loginBtn) {
+    loginBtn.addEventListener("click", ev => {
+      ev.preventDefault();
+      submitAuth();
     });
   }
 
-  if (guestBtn) {
-    guestBtn.addEventListener("click", async () => {
-      try {
-        const g = await apiFetch("/auth/guest", { method: "POST", body: "{}" });
-        setToken(g.token);
-        await syncFromServer();
-        finalizeAuthenticatedEntry("home", { replaceHistory: true });
-        showToast("Guest household mode");
-        return;
-      } catch (_e) {
-        const guest = AppState.users.find(u => u.role === "household");
-        if (guest) {
-          AppState.currentUserId = guest.id;
-          AppState.currentUserName = guest.name || "User";
-          AppState.role = normalizeRole(guest.role);
-          persistSession();
-        }
-        finalizeAuthenticatedEntry("home", { replaceHistory: true });
-        showToast("Guest household mode");
-      }
-    });
-  }
 }
 
 function initAdminActions() {
